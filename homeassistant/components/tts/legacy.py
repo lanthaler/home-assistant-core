@@ -38,6 +38,7 @@ from .const import (
     ATTR_LANGUAGE,
     ATTR_MESSAGE,
     ATTR_OPTIONS,
+    ATTR_PREGENERATE,
     CONF_CACHE,
     CONF_CACHE_DIR,
     CONF_FIELDS,
@@ -86,6 +87,7 @@ SCHEMA_SERVICE_SAY = probatio.Schema(
     {
         probatio.Required(ATTR_MESSAGE): cv.string,
         probatio.Optional(ATTR_CACHE): cv.boolean,
+        probatio.Optional(ATTR_PREGENERATE): cv.boolean,
         probatio.Required(ATTR_ENTITY_ID): cv.comp_entity_ids,
         probatio.Optional(ATTR_LANGUAGE): cv.string,
         probatio.Optional(ATTR_OPTIONS): dict,
@@ -147,20 +149,36 @@ async def async_setup_legacy(
         async def async_say_handle(service: ServiceCall) -> None:
             """Service handle for say."""
             entity_ids = service.data[ATTR_ENTITY_ID]
+            message = service.data[ATTR_MESSAGE]
+            language = service.data.get(ATTR_LANGUAGE)
+            options = service.data.get(ATTR_OPTIONS)
+            cache = service.data.get(ATTR_CACHE)
+            pregenerate = service.data.get(ATTR_PREGENERATE)
+
+            media_content_id = generate_media_source_id(
+                hass,
+                engine=p_type,
+                message=message,
+                language=language,
+                options=options,
+                cache=cache,
+                pregenerate=pregenerate,
+            )
+            if pregenerate:
+                await hass.data[DATA_TTS_MANAGER].async_pregenerate_tts(
+                    engine=p_type,
+                    message=message,
+                    use_file_cache=cache,
+                    language=language,
+                    options=options,
+                )
 
             await hass.services.async_call(
                 MP_DOMAIN,
                 MediaPlayerService.PLAY_MEDIA,
                 {
                     ATTR_ENTITY_ID: entity_ids,
-                    MediaPlayerServiceArgument.MEDIA_CONTENT_ID: generate_media_source_id(
-                        hass,
-                        engine=p_type,
-                        message=service.data[ATTR_MESSAGE],
-                        language=service.data.get(ATTR_LANGUAGE),
-                        options=service.data.get(ATTR_OPTIONS),
-                        cache=service.data.get(ATTR_CACHE),
-                    ),
+                    MediaPlayerServiceArgument.MEDIA_CONTENT_ID: media_content_id,
                     MediaPlayerServiceArgument.MEDIA_CONTENT_TYPE: MediaType.MUSIC,
                     MediaPlayerServiceArgument.ANNOUNCE: True,
                 },

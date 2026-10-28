@@ -56,6 +56,7 @@ from .const import (
     ATTR_MEDIA_PLAYER_ENTITY_ID,
     ATTR_MESSAGE,
     ATTR_OPTIONS,
+    ATTR_PREGENERATE,
     CONF_CACHE,
     CONF_CACHE_DIR,
     CONF_TIME_MEMORY,
@@ -63,6 +64,7 @@ from .const import (
     DATA_TTS_MANAGER,
     DEFAULT_CACHE,
     DEFAULT_CACHE_DIR,
+    DEFAULT_PREGENERATE,
     DEFAULT_TIME_MEMORY,
     DOMAIN,
     MEDIA_SOURCE_STREAM_PATH,
@@ -170,6 +172,9 @@ class TTSCache:
     _consumers: list[asyncio.Queue[bytes | None]] | None = None
     """Queue for consumers to receive data while loading."""
 
+    loading_task: asyncio.Task[None] | None = None
+    """Background task loading the cache."""
+
     def __init__(
         self,
         cache_key: str,
@@ -205,7 +210,16 @@ class TTSCache:
 
         self._result_data = b"".join(self._partial_data)
         self._partial_data = None
+        self.last_used = monotonic()
         return self._result_data
+
+    async def async_wait_finished(self) -> None:
+        """Wait until the data has been fully loaded."""
+        if self.loading_task is not None and not self.loading_task.done():
+            await asyncio.shield(self.loading_task)
+        if self._loading_error is not None:
+            raise self._loading_error
+        self.last_used = monotonic()
 
     async def async_stream_data(self) -> AsyncGenerator[bytes]:
         """Stream the data.
@@ -735,6 +749,7 @@ class ResultStream:
 
     # Override
     _override_media_path: Path | None = None
+    pregenerate: bool = DEFAULT_PREGENERATE
 
     @cached_property
     def url(self) -> str:
@@ -834,6 +849,18 @@ class ResultStream:
                 translation_key="no_engine",
             )
         return self.engine, self.language
+
+    async def async_pregenerate(self) -> None:
+        """Wait until the result has been fully generated in memory."""
+        if self._override_media_path is not None:
+            async for _ in self._async_stream_override_result():
+                pass
+            self._async_mark_used()
+            return
+
+        cache = await self._result_cache
+        await cache.async_wait_finished()
+        self._async_mark_used()
 
     async def async_stream_result(self) -> AsyncGenerator[bytes]:
         """Get the stream of this result."""
@@ -1167,6 +1194,7 @@ class SpeechManager:
         use_file_cache: bool | None = None,
         language: str | None = None,
         options: dict | None = None,
+        pregenerate: bool | None = None,
     ) -> ResultStream:
         """Create a streaming URL where the rendered TTS can be retrieved."""
         if (engine_instance := get_engine_instance(self.hass, engine)) is None:
@@ -1183,6 +1211,8 @@ class SpeechManager:
         language, options = self.process_options(engine_instance, language, options)
         if use_file_cache is None:
             use_file_cache = self.use_file_cache
+        if pregenerate is None:
+            pregenerate = DEFAULT_PREGENERATE
 
         return self._async_add_result_stream(
             engine=engine,
@@ -1190,7 +1220,39 @@ class SpeechManager:
             language=language,
             options=options,
             supports_streaming_input=supports_streaming_input,
+            pregenerate=pregenerate,
         )
+
+    async def async_pregenerate_tts(
+        self,
+        engine: str,
+        message: str,
+        use_file_cache: bool | None = None,
+        language: str | None = None,
+        options: dict | None = None,
+    ) -> None:
+        """Pregenerate TTS audio in memory and optionally store to disk."""
+        if (engine_instance := get_engine_instance(self.hass, engine)) is None:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="provider_not_found",
+                translation_placeholders={"engine": engine},
+            )
+
+        language, merged_options = self.process_options(
+            engine_instance, language, options
+        )
+        if use_file_cache is None:
+            use_file_cache = self.use_file_cache
+
+        cache = self.async_cache_message_in_memory(
+            engine=engine,
+            message=message,
+            use_file_cache=use_file_cache,
+            language=language,
+            options=merged_options,
+        )
+        await cache.async_wait_finished()
 
     @callback
     def async_create_audio_result_stream(
@@ -1225,6 +1287,7 @@ class SpeechManager:
         language: str | None,
         options: dict,
         supports_streaming_input: bool,
+        pregenerate: bool = DEFAULT_PREGENERATE,
     ) -> ResultStream:
         """Create a result stream and register its token."""
         extension = options.get(ATTR_PREFERRED_FORMAT, _DEFAULT_FORMAT)
@@ -1241,6 +1304,7 @@ class SpeechManager:
             supports_streaming_input=supports_streaming_input,
             hass=self.hass,
             _manager=self,
+            pregenerate=pregenerate,
         )
         self.token_to_stream[token] = result_stream
         self.token_to_stream_cleanup.schedule()
@@ -1277,7 +1341,7 @@ class SpeechManager:
             data_gen=data_gen,
         )
         self.mem_cache[cache_key] = cache
-        self.hass.async_create_background_task(
+        cache.loading_task = self.hass.async_create_background_task(
             self._load_data_into_cache(
                 cache, engine_instance, "[Streaming TTS]", False, language, options
             ),
@@ -1338,7 +1402,7 @@ class SpeechManager:
             data_gen=data_gen,
         )
         self.mem_cache[cache_key] = cache
-        self.hass.async_create_background_task(
+        cache.loading_task = self.hass.async_create_background_task(
             self._load_data_into_cache(
                 cache, engine_instance, message, store_to_disk, language, options
             ),
@@ -1378,7 +1442,7 @@ class SpeechManager:
             data_gen=data_gen,
         )
         self.mem_cache[cache.cache_key] = cache
-        self.hass.async_create_background_task(
+        cache.loading_task = self.hass.async_create_background_task(
             self._load_audio_stream_into_cache(cache),
             "tts_load_audio_stream_into_cache",
         )
@@ -1392,6 +1456,10 @@ class SpeechManager:
         except Exception as err:  # pylint: disable=broad-except  # noqa: BLE001
             _LOGGER.error("Error getting audio from stream: %s", err)
             self.mem_cache.pop(cache.cache_key, None)
+            return
+
+        self.mem_cache[cache.cache_key] = cache
+        self.memcache_cleanup.schedule()
 
     async def _load_data_into_cache(
         self,
@@ -1412,6 +1480,9 @@ class SpeechManager:
             _LOGGER.error("Error getting audio for %s: %s", trunc_msg, err)
             self.mem_cache.pop(cache.cache_key, None)
             return
+
+        self.mem_cache[cache.cache_key] = cache
+        self.memcache_cleanup.schedule()
 
         if not store_to_disk:
             return
@@ -1701,6 +1772,7 @@ class TextToSpeechUrlView(HomeAssistantView):
         use_file_cache = data.get(ATTR_CACHE)
         language = data.get(ATTR_LANGUAGE)
         options = data.get(ATTR_OPTIONS)
+        pregenerate = data.get(ATTR_PREGENERATE)
 
         try:
             stream = self.manager.async_create_result_stream(
@@ -1708,12 +1780,20 @@ class TextToSpeechUrlView(HomeAssistantView):
                 use_file_cache=use_file_cache,
                 language=language,
                 options=options,
+                pregenerate=pregenerate,
             )
         except HomeAssistantError as err:
             _LOGGER.error("Error on init tts: %s", err)
             return self.json({"error": err}, HTTPStatus.BAD_REQUEST)
 
         stream.async_set_message(message)
+        if stream.pregenerate:
+            try:
+                await stream.async_pregenerate()
+            except Exception as err:  # noqa: BLE001
+                return self.json(
+                    {"error": str(err)}, HTTPStatus.INTERNAL_SERVER_ERROR
+                )
 
         base = get_url(self.manager.hass)
         url = base + stream.url

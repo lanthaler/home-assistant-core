@@ -36,6 +36,7 @@ def generate_media_source_id(
     language: str | None = None,
     options: dict | None = None,
     cache: bool | None = None,
+    pregenerate: bool | None = None,
 ) -> str:
     """Generate a media source ID for text-to-speech."""
     from . import async_resolve_engine  # noqa: PLC0415
@@ -56,6 +57,8 @@ def generate_media_source_id(
     }
     if cache is not None:
         params["cache"] = "true" if cache else "false"
+    if pregenerate is not None:
+        params["pregenerate"] = "true" if pregenerate else "false"
     if language is not None:
         params["language"] = language
     params[URL_QUERY_TTS_OPTIONS] = json.dumps(options, separators=(",", ":"))
@@ -73,6 +76,7 @@ class MediaSourceOptions(TypedDict):
     language: str | None
     options: dict | None
     use_file_cache: bool | None
+    pregenerate: bool | None
 
 
 class ParsedMediaSourceId(TypedDict):
@@ -107,7 +111,7 @@ def parse_media_source_id(
         options = {
             k: v
             for k, v in parsed.query.items()
-            if k not in ("message", "language", "cache")
+            if k not in ("message", "language", "cache", "pregenerate")
         }
     if "message" not in parsed.query:
         raise Unresolvable("No message specified.")
@@ -116,9 +120,12 @@ def parse_media_source_id(
         "language": parsed.query.get("language"),
         "options": options,
         "use_file_cache": None,
+        "pregenerate": None,
     }
     if "cache" in parsed.query:
         kwargs["use_file_cache"] = parsed.query["cache"] == "true"
+    if "pregenerate" in parsed.query:
+        kwargs["pregenerate"] = parsed.query["pregenerate"] == "true"
 
     return {"message": parsed.query["message"], "options": kwargs}
 
@@ -153,6 +160,12 @@ class TTSMediaSource(MediaSource):
 
         if stream is None:
             raise Unresolvable("Stream not found")
+
+        if stream.pregenerate:
+            try:
+                await stream.async_pregenerate()
+            except Exception as err:
+                raise Unresolvable(str(err)) from err
 
         return PlayMedia(
             stream.url, stream.content_type, path=stream.async_get_media_path()

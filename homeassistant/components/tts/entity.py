@@ -19,7 +19,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN, TtsAudioType
+from .const import DATA_TTS_MANAGER, DEFAULT_PREGENERATE, DOMAIN, TtsAudioType
 from .media_source import generate_media_source_id
 from .models import Voice
 
@@ -135,21 +135,33 @@ class TextToSpeechEntity(RestoreEntity, cached_properties=CACHED_PROPERTIES_WITH
         cache: bool,
         language: str | None = None,
         options: dict | None = None,
+        pregenerate: bool = DEFAULT_PREGENERATE,
     ) -> None:
         """Speak via a Media Player."""
+        media_content_id = generate_media_source_id(
+            self.hass,
+            message=message,
+            engine=self.entity_id,
+            language=language,
+            options=options,
+            cache=cache,
+            pregenerate=pregenerate,
+        )
+        if pregenerate:
+            await self.hass.data[DATA_TTS_MANAGER].async_pregenerate_tts(
+                engine=self.entity_id,
+                message=message,
+                use_file_cache=cache,
+                language=language,
+                options=options,
+            )
+
         await self.hass.services.async_call(
             MP_DOMAIN,
             MediaPlayerService.PLAY_MEDIA,
             {
                 ATTR_ENTITY_ID: media_player_entity_id,
-                MediaPlayerServiceArgument.MEDIA_CONTENT_ID: generate_media_source_id(
-                    self.hass,
-                    message=message,
-                    engine=self.entity_id,
-                    language=language,
-                    options=options,
-                    cache=cache,
-                ),
+                MediaPlayerServiceArgument.MEDIA_CONTENT_ID: media_content_id,
                 MediaPlayerServiceArgument.MEDIA_CONTENT_TYPE: MediaType.MUSIC,
                 MediaPlayerServiceArgument.ANNOUNCE: True,
             },

@@ -24,7 +24,7 @@ from pytest_homeassistant.common import (
 )
 from pytest_homeassistant.typing import ClientSessionGenerator, WebSocketGenerator
 
-from homeassistant.components import ffmpeg, tts
+from homeassistant.components import ffmpeg, media_source, tts
 from homeassistant.components.media_player import (
     ATTR_MEDIA_ANNOUNCE,
     ATTR_MEDIA_CONTENT_ID,
@@ -1340,33 +1340,51 @@ async def test_tags_with_wave() -> None:
     indirect=["setup"],
 )
 @pytest.mark.parametrize(
-    ("engine", "language", "options", "cache", "result_query"),
+    ("engine", "language", "options", "cache", "pregenerate", "result_query"),
     [
-        (None, None, None, None, "&tts_options=null"),
-        (None, "de_DE", None, None, "&language=de_DE&tts_options=null"),
+        (None, None, None, None, None, "&tts_options=null"),
+        (None, "de_DE", None, None, None, "&language=de_DE&tts_options=null"),
         (
             None,
             "de_DE",
             {"voice": "henk"},
             None,
+            None,
             "&language=de_DE&tts_options=%7B%22voice%22:%22henk%22%7D",
         ),
-        (None, "de_DE", None, True, "&cache=true&language=de_DE&tts_options=null"),
+        (None, "de_DE", None, True, None, "&cache=true&language=de_DE&tts_options=null"),
+        (
+            None,
+            "de_DE",
+            None,
+            False,
+            True,
+            "&cache=false&pregenerate=true&language=de_DE&tts_options=null",
+        ),
+        (
+            None,
+            None,
+            None,
+            None,
+            False,
+            "&pregenerate=false&tts_options=null",
+        ),
     ],
 )
+@pytest.mark.usefixtures("setup")
 async def test_generate_media_source_id(
     hass: HomeAssistant,
-    setup: str,
     result_engine: str,
     engine: str | None,
     language: str | None,
     options: dict[str, Any] | None,
     cache: bool | None,
+    pregenerate: bool | None,
     result_query: str,
 ) -> None:
     """Test generating a media source ID."""
     media_source_id = tts.generate_media_source_id(
-        hass, "msg", engine, language, options, cache
+        hass, "msg", engine, language, options, cache, pregenerate
     )
 
     assert media_source_id.startswith("media-source://tts/")
@@ -3146,3 +3164,411 @@ async def test_cache_message_unknown_provider(hass: HomeAssistant) -> None:
     assert exc_info.value.translation_domain == tts.DOMAIN
     assert exc_info.value.translation_key == "provider_not_found"
     assert exc_info.value.translation_placeholders == {"engine": "non-existing"}
+
+    with pytest.raises(HomeAssistantError) as exc_info:
+        await manager.async_pregenerate_tts("non-existing", "hello")
+    assert exc_info.value.translation_domain == tts.DOMAIN
+    assert exc_info.value.translation_key == "provider_not_found"
+    assert exc_info.value.translation_placeholders == {"engine": "non-existing"}
+
+
+@pytest.mark.parametrize(
+    ("tts_service", "service_data"),
+    [
+        pytest.param(
+            "test_say",
+            {
+                ATTR_ENTITY_ID: "media_player.something",
+                tts.ATTR_MESSAGE: "A very long message to pregenerate.",
+                tts.ATTR_CACHE: False,
+                tts.ATTR_PREGENERATE: True,
+            },
+            id="legacy_say",
+        ),
+        pytest.param(
+            "speak",
+            {
+                ATTR_ENTITY_ID: "tts.test",
+                tts.ATTR_MEDIA_PLAYER_ENTITY_ID: "media_player.something",
+                tts.ATTR_MESSAGE: "A very long message to pregenerate.",
+                tts.ATTR_CACHE: False,
+                tts.ATTR_PREGENERATE: True,
+            },
+            id="entity_speak",
+        ),
+    ],
+)
+async def test_service_pregenerate_memory_only(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    mock_tts_cache_dir: Path,
+    tts_service: str,
+    service_data: dict[str, str | bool],
+) -> None:
+    """Test pregenerate=True waits for full audio in RAM without writing to disk when cache=False."""
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    audio_calls = 0
+
+    class SlowProvider(MockTTSProvider):
+        """Provider that waits for finish event before returning audio."""
+
+        async def async_get_tts_audio(
+            self, message: str, language: str, options: dict[str, str]
+        ) -> tts.TtsAudioType:
+            nonlocal audio_calls
+            audio_calls += 1
+            started.set()
+            await finish.wait()
+            return ("mp3", b"full-pregenerated-audio")
+
+    class SlowStreamingEntity(MockTTSEntity):
+        """Streaming entity that waits for finish event before finishing audio."""
+
+        async def async_stream_tts_audio(
+            self, request: tts.TTSAudioRequest
+        ) -> tts.TTSAudioResponse:
+            nonlocal audio_calls
+            audio_calls += 1
+            _ = [chunk async for chunk in request.message_gen]
+
+            async def gen_audio() -> AsyncGenerator[bytes]:
+                yield b"full-"
+                started.set()
+                await finish.wait()
+                yield b"pregenerated-audio"
+
+            return tts.TTSAudioResponse("mp3", gen_audio())
+
+    await mock_setup(hass, SlowProvider(DEFAULT_LANG))
+    await mock_config_entry_setup(hass, SlowStreamingEntity(DEFAULT_LANG))
+
+    calls = async_mock_service(hass, MP_DOMAIN, SERVICE_PLAY_MEDIA)
+
+    service_task = hass.async_create_task(
+        hass.services.async_call(
+            tts.DOMAIN,
+            tts_service,
+            service_data,
+            blocking=True,
+        )
+    )
+    await started.wait()
+    await asyncio.sleep(0)
+
+    # Media player must not be called until the entire audio is pregenerated
+    assert len(calls) == 0
+    assert not service_task.done()
+
+    finish.set()
+    await service_task
+
+    assert len(calls) == 1
+    assert list(mock_tts_cache_dir.iterdir()) == []
+    assert len(hass.data[tts.DATA_TTS_MANAGER].mem_cache) == 1
+
+    url = await get_media_source_url(hass, calls[0].data[ATTR_MEDIA_CONTENT_ID])
+    client = await hass_client()
+    req = await client.get(url)
+    assert req.status == HTTPStatus.OK
+    assert await req.read() == b"full-pregenerated-audio"
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    # Audio was served from RAM without calling the TTS engine again or touching disk
+    assert audio_calls == 1
+    assert list(mock_tts_cache_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("setup", "tts_service", "service_data", "expected_url_suffix"),
+    [
+        pytest.param(
+            "mock_setup",
+            "test_say",
+            {
+                ATTR_ENTITY_ID: "media_player.something",
+                tts.ATTR_MESSAGE: "There is someone at the door.",
+                tts.ATTR_CACHE: True,
+                tts.ATTR_PREGENERATE: True,
+            },
+            "test",
+            id="legacy_say",
+        ),
+        pytest.param(
+            "mock_config_entry_setup",
+            "speak",
+            {
+                ATTR_ENTITY_ID: "tts.test",
+                tts.ATTR_MEDIA_PLAYER_ENTITY_ID: "media_player.something",
+                tts.ATTR_MESSAGE: "There is someone at the door.",
+                tts.ATTR_CACHE: True,
+                tts.ATTR_PREGENERATE: True,
+            },
+            "tts.test",
+            id="entity_speak",
+        ),
+    ],
+    indirect=["setup"],
+)
+@pytest.mark.usefixtures("setup")
+async def test_service_pregenerate_with_disk_cache(
+    hass: HomeAssistant,
+    mock_tts_cache_dir: Path,
+    tts_service: str,
+    service_data: dict[str, str | bool],
+    expected_url_suffix: str,
+) -> None:
+    """Test pregenerate=True with cache=True stores audio both in RAM and on disk before playback."""
+    assert await async_setup_component(hass, media_source.DOMAIN, {})
+    calls = async_mock_service(hass, MP_DOMAIN, SERVICE_PLAY_MEDIA)
+
+    await hass.services.async_call(
+        tts.DOMAIN,
+        tts_service,
+        service_data,
+        blocking=True,
+    )
+
+    assert len(calls) == 1
+    expected_file = (
+        mock_tts_cache_dir
+        / f"42f18378fd4393d18c8dd11d03fa9563c1e54491_en-us_-_{expected_url_suffix}.mp3"
+    )
+    assert expected_file.is_file()
+    assert len(hass.data[tts.DATA_TTS_MANAGER].mem_cache) == 1
+
+    resolved = await media_source.async_resolve_media(
+        hass, calls[0].data[ATTR_MEDIA_CONTENT_ID], None
+    )
+    assert resolved.path == expected_file
+
+
+@pytest.mark.parametrize(
+    ("tts_service", "service_data"),
+    [
+        pytest.param(
+            "test_say",
+            {
+                ATTR_ENTITY_ID: "media_player.something",
+                tts.ATTR_MESSAGE: "Failing message",
+                tts.ATTR_PREGENERATE: True,
+            },
+            id="legacy_say",
+        ),
+        pytest.param(
+            "speak",
+            {
+                ATTR_ENTITY_ID: "tts.test",
+                tts.ATTR_MEDIA_PLAYER_ENTITY_ID: "media_player.something",
+                tts.ATTR_MESSAGE: "Failing message",
+                tts.ATTR_PREGENERATE: True,
+            },
+            id="entity_speak",
+        ),
+    ],
+)
+async def test_service_pregenerate_error_does_not_play_media(
+    hass: HomeAssistant,
+    tts_service: str,
+    service_data: dict[str, str | bool],
+) -> None:
+    """Test pregenerate=True aborts before calling media_player.play_media if synthesis fails."""
+
+    class FailingProvider(MockTTSProvider):
+        """Provider that fails synthesis."""
+
+        def get_tts_audio(
+            self, message: str, language: str, options: dict[str, str]
+        ) -> tts.TtsAudioType:
+            return (None, None)
+
+    class FailingEntity(MockTTSEntity):
+        """Entity that fails synthesis."""
+
+        def get_tts_audio(
+            self, message: str, language: str, options: dict[str, str]
+        ) -> tts.TtsAudioType:
+            return (None, None)
+
+    await mock_setup(hass, FailingProvider(DEFAULT_LANG))
+    await mock_config_entry_setup(hass, FailingEntity(DEFAULT_LANG))
+
+    calls = async_mock_service(hass, MP_DOMAIN, SERVICE_PLAY_MEDIA)
+
+    with pytest.raises(HomeAssistantError):
+        await hass.services.async_call(
+            tts.DOMAIN,
+            tts_service,
+            service_data,
+            blocking=True,
+        )
+
+    assert len(calls) == 0
+
+
+async def test_web_get_url_pregenerate_memory_only(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    mock_tts_cache_dir: Path,
+) -> None:
+    """Test /api/tts_get_url with pregenerate=True and cache=False waits in RAM only."""
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    audio_calls = 0
+
+    class SlowEntity(MockTTSEntity):
+        """Entity that blocks until finish event is set."""
+
+        async def async_get_tts_audio(
+            self, message: str, language: str, options: dict[str, str]
+        ) -> tts.TtsAudioType:
+            nonlocal audio_calls
+            audio_calls += 1
+            started.set()
+            await finish.wait()
+            return ("mp3", b"url-pregenerated-audio")
+
+    await mock_config_entry_setup(hass, SlowEntity(DEFAULT_LANG))
+    client = await hass_client()
+
+    post_task = hass.async_create_task(
+        client.post(
+            "/api/tts_get_url",
+            json={
+                "engine_id": "tts.test",
+                "message": "Long URL message",
+                "cache": False,
+                "pregenerate": True,
+            },
+        )
+    )
+    await started.wait()
+    await asyncio.sleep(0)
+    assert not post_task.done()
+
+    finish.set()
+    req = await post_task
+    assert req.status == HTTPStatus.OK
+    response = await req.json()
+    assert list(mock_tts_cache_dir.iterdir()) == []
+
+    audio_req = await client.get(response["path"])
+    assert audio_req.status == HTTPStatus.OK
+    assert await audio_req.read() == b"url-pregenerated-audio"
+    assert audio_calls == 1
+    assert list(mock_tts_cache_dir.iterdir()) == []
+
+
+async def test_web_get_url_pregenerate_with_disk_cache(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    mock_tts_cache_dir: Path,
+) -> None:
+    """Test /api/tts_get_url with pregenerate=True and cache=True writes file before returning."""
+    await mock_config_entry_setup(hass, MockTTSEntity(DEFAULT_LANG))
+    client = await hass_client()
+
+    req = await client.post(
+        "/api/tts_get_url",
+        json={
+            "engine_id": "tts.test",
+            "message": "There is someone at the door.",
+            "cache": True,
+            "pregenerate": True,
+        },
+    )
+    assert req.status == HTTPStatus.OK
+    expected_file = (
+        mock_tts_cache_dir
+        / "42f18378fd4393d18c8dd11d03fa9563c1e54491_en-us_-_tts.test.mp3"
+    )
+    assert expected_file.is_file()
+
+
+async def test_web_get_url_pregenerate_error(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+) -> None:
+    """Test /api/tts_get_url with pregenerate=True returns 500 when synthesis fails."""
+
+    class FailingEntity(MockTTSEntity):
+        """Entity that raises an error during synthesis."""
+
+        async def async_get_tts_audio(
+            self, message: str, language: str, options: dict[str, str]
+        ) -> tts.TtsAudioType:
+            raise HomeAssistantError("Synthesis failed")
+
+    await mock_config_entry_setup(hass, FailingEntity(DEFAULT_LANG))
+    client = await hass_client()
+
+    req = await client.post(
+        "/api/tts_get_url",
+        json={
+            "engine_id": "tts.test",
+            "message": "Failing message",
+            "pregenerate": True,
+        },
+    )
+    assert req.status == HTTPStatus.INTERNAL_SERVER_ERROR
+    assert await req.json() == {"error": "Synthesis failed"}
+
+
+async def test_pregenerate_longer_than_memory_cache_maxage(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    mock_tts_cache_dir: Path,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Test pregenerated audio remains in memory even when generation exceeds memory_cache_maxage."""
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    audio_calls = 0
+
+    class VerySlowEntity(MockTTSEntity):
+        """Entity taking longer than DEFAULT_TIME_MEMORY to generate audio."""
+
+        async def async_get_tts_audio(
+            self, message: str, language: str, options: dict[str, str]
+        ) -> tts.TtsAudioType:
+            nonlocal audio_calls
+            audio_calls += 1
+            started.set()
+            await finish.wait()
+            return ("mp3", b"very-slow-audio")
+
+    await mock_config_entry_setup(hass, VerySlowEntity(DEFAULT_LANG))
+    calls = async_mock_service(hass, MP_DOMAIN, SERVICE_PLAY_MEDIA)
+
+    speak_task = hass.async_create_task(
+        hass.services.async_call(
+            tts.DOMAIN,
+            "speak",
+            {
+                ATTR_ENTITY_ID: "tts.test",
+                tts.ATTR_MEDIA_PLAYER_ENTITY_ID: "media_player.something",
+                tts.ATTR_MESSAGE: "Extremely long message",
+                tts.ATTR_CACHE: False,
+                tts.ATTR_PREGENERATE: True,
+            },
+            blocking=True,
+        )
+    )
+    await started.wait()
+
+    # Advance monotonic/wall clock past DEFAULT_TIME_MEMORY while synthesis is still running
+    freezer.tick(DEFAULT_TIME_MEMORY + 10)
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+
+    finish.set()
+    await speak_task
+
+    assert len(calls) == 1
+    url = await get_media_source_url(hass, calls[0].data[ATTR_MEDIA_CONTENT_ID])
+    client = await hass_client()
+    req = await client.get(url)
+    assert req.status == HTTPStatus.OK
+    assert await req.read() == b"very-slow-audio"
+    assert audio_calls == 1
+    assert list(mock_tts_cache_dir.iterdir()) == []
